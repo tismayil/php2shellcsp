@@ -39,7 +39,7 @@ cannot measure something, the verdict says so. Revolutionary concept, I know.
 ## Install
 
 ```bash
-git clone <your-gitlab>/php2shell.git
+git clone https://github.com/tismayil/php2shellcsp/php2shell.git
 cd php2shell
 python3 scanner.py --help
 ```
